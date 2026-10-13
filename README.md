@@ -283,3 +283,7 @@ directory when it finishes; if a run was killed midway, `sudo chown -R $USER dum
 docker compose down -v
 docker compose up -d
 ```
+
+## License
+
+[MIT](LICENSE)
