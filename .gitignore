@@ -1,0 +1,23 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Local Compose overrides (machine-specific wiring)
+docker-compose.override.yml
+!docker-compose.override.yml.example
+
+# Init scripts are per-deployment and often hold passwords or data
+init/*
+!init/.gitkeep
+
+# Snapshots from scripts/pull.sh — NOT versioned, they are large and hold real data
+dumps/
+*.dump
+*.sql
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

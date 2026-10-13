@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.3}
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # On-demand tooling: docker compose run --rm snapshot <pull|restore> ...
+  snapshot:
+    build:
+      context: .
+      dockerfile: snapshot.Dockerfile
+      args:
+        POSTGRES_IMAGE: ${POSTGRES_IMAGE:-postgres:16.3}
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Shares postgres' network namespace: 127.0.0.1:5432 is always this stack's server
+    network_mode: "service:postgres"
+    env_file:
+      - .env
+    environment:
+      # Passed through from the host shell only, never read from .env
+      - SRC_PGPASSWORD
+      - SRC_PGUSER
+    volumes:
+      - .:/work
+
+volumes:
+  postgres_data:

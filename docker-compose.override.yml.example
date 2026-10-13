@@ -1,0 +1,29 @@
+# Template for local overrides. Compose merges docker-compose.override.yml
+# automatically; the real file is git-ignored.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+
+# Join an existing network so other containers reach the server by name.
+# Create it first: docker network create my-shared-network
+# networks:
+#   default:
+#     name: my-shared-network
+#     external: true
+
+# services:
+#   # Fixed container name, used as the hostname on that network.
+#   postgres:
+#     container_name: my-postgres
+#
+#   snapshot:
+#     volumes:
+#       # Required for docker:<container> sources. Grants the snapshot container full
+#       # control of the host's Docker, so only enable it if you use those sources.
+#       - /var/run/docker.sock:/var/run/docker.sock
+#       # Required for ssh: sources. Keys are copied with the right permissions on start.
+#       - ~/.ssh:/ssh-src:ro
+
+# Fixed volume name, to reuse a volume across projects.
+# volumes:
+#   postgres_data:
+#     name: my-postgres-data
