@@ -159,6 +159,12 @@ Copies the file into a new snapshot so `restore` treats it like any other source
 Excluded tables keep their schema; they just come back empty. Names follow `pg_dump`
 patterns, so `audit_log` matches in any schema and `sales.audit_log` in one.
 
+**Exclude leaf tables.** `pg_restore` adds constraints after loading data, so if another table
+has a foreign key into an excluded one, the restore fails as soon as that table has rows.
+`pull` reads the foreign keys out of the new dump and warns about each one
+(`⚠️ ... has a foreign key into ..., whose data is excluded`); exclude the referencing table's
+data too. A failed restore leaves the live database untouched (see below).
+
 ## How the restore works
 
 ```bash
@@ -264,7 +270,7 @@ failure; the staging copies are dropped and the live databases stay as they were
 cause and run `restore` again. Common causes:
 
 - `violates foreign key constraint`: a table's data was excluded while another table still
-  points at it. Exclude the referencing table too.
+  points at it — `pull` warned about it. Exclude the referencing table too.
 - `could not open extension control file`: the local image doesn't ship an extension the
   source uses (PostGIS, for instance). Use an image that has it as `POSTGRES_IMAGE`.
 

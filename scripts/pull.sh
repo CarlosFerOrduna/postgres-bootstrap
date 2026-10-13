@@ -85,6 +85,7 @@ done
 # --- pg_dump arguments shared by every remote source -----------------------
 
 PG_DUMP_ARGS=(-Fc)
+EXCLUDED_TABLES=()
 if [[ "$SCHEMA_ONLY" == true ]]; then
   PG_DUMP_ARGS+=(--schema-only)
 elif [[ "$INCLUDE_ALL_DATA" == false && -n "$EXCLUDE_TABLE_DATA" ]]; then
@@ -229,6 +230,34 @@ dump_db_to_stdout() {
   esac
 }
 
+# pg_restore adds constraints after loading data, so a foreign key into a table whose data was
+# skipped fails the restore as soon as the referencing table has rows. Read from the dump itself,
+# so the source still only ever sees pg_dump.
+warn_about_fks_into_excluded_tables() {
+  local dump="$1" db="$2" line referencing="" referenced candidate pattern
+  local alter_table_regex='^ALTER TABLE (ONLY )?([^ ]+)'
+  local foreign_key_regex='FOREIGN KEY.*REFERENCES ([^(]+)[(]'
+  local quote='"'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $alter_table_regex ]]; then
+      referencing="${BASH_REMATCH[2]//$quote/}"
+    elif [[ "$line" =~ $foreign_key_regex ]]; then
+      referenced="${BASH_REMATCH[1]//$quote/}"
+      for pattern in "${EXCLUDED_TABLES[@]}"; do
+        [[ -n "$pattern" ]] || continue
+        # Unqualified patterns match the table in any schema, as in pg_dump
+        candidate="$referenced"
+        [[ "$pattern" == *.* ]] || candidate="${referenced##*.}"
+        # shellcheck disable=SC2053 # the pattern is a glob on purpose, like pg_dump's
+        if [[ "$candidate" == $pattern && "$referencing" != "$referenced" ]]; then
+          echo "⚠️  $db: $referencing has a foreign key into $referenced, whose data is excluded;" \
+            "the restore fails if $referencing has rows. Exclude $referencing's data too."
+        fi
+      done
+    fi
+  done < <(pg_restore --section=post-data -f - "$dump")
+}
+
 pull_dumps() {
   local db target
   for db in "${DB_LIST[@]}"; do
@@ -237,6 +266,9 @@ pull_dumps() {
     dump_db_to_stdout "$db" > "$target"
     [[ "$(head -c 5 "$target")" == "PGDMP" ]] || die "$db dump is not a valid custom-format archive"
     echo "✅ $db → $target ($(du -h "$target" | cut -f1))"
+    if [[ ${#EXCLUDED_TABLES[@]} -gt 0 ]]; then
+      warn_about_fks_into_excluded_tables "$target" "$db"
+    fi
   done
 }
 
