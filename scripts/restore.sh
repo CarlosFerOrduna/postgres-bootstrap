@@ -20,7 +20,7 @@ usage() {
 Usage: docker compose run --rm snapshot restore [dumps/<snapshot>]
 
 Restores every <db>.dump / <db>.sql in the snapshot into this stack's postgres service.
-Each database is dropped and recreated first.
+Each database is loaded into a staging copy first; the live ones are replaced only if all succeed.
 
 Default snapshot: the most recent one under dumps/.
 Owner roles come from DB_OWNERS (db:role,db:role) in env or .env; databases without an
@@ -96,6 +96,14 @@ echo "📦 Restoring snapshot $SNAPSHOT_DIR into postgres"
 
 # --- Restore ---------------------------------------------------------------
 
+# Every database is loaded under this temporary name first; the live one is only replaced once
+# all of them loaded, so a bad dump, a broken FK or a missing extension never costs the old data
+STAGING_SUFFIX="__restoring"
+
+staging_name_for() {
+  printf '%s%s' "$1" "$STAGING_SUFFIX"
+}
+
 ensure_role() {
   local role="$1" exists
   exists="$(target_psql -At -d postgres -v role="$role" <<'SQL'
@@ -110,23 +118,37 @@ SQL
   echo "⚠️  Created role $role without a password; set one with ALTER ROLE"
 }
 
-recreate_database() {
-  local db="$1" role="$2" owner_clause=""
+create_staging_database() {
+  local staging="$1" role="$2" owner_clause=""
   [[ -z "$role" ]] || owner_clause='OWNER :"role"'
   # Over stdin each statement is its own transaction: DROP/CREATE DATABASE reject a transaction block
-  target_psql -d postgres -v db="$db" -v role="$role" <<SQL
+  target_psql -d postgres -v db="$staging" -v role="$role" <<SQL
 DROP DATABASE IF EXISTS :"db" WITH (FORCE);
 CREATE DATABASE :"db" $owner_clause TEMPLATE template0 ENCODING 'UTF8';
 SQL
 }
 
+drop_database() {
+  target_psql -d postgres -v db="$1" <<'SQL'
+DROP DATABASE IF EXISTS :"db" WITH (FORCE);
+SQL
+}
+
+replace_database() {
+  local db="$1" staging="$2"
+  target_psql -d postgres -v db="$db" -v staging="$staging" <<'SQL'
+DROP DATABASE IF EXISTS :"db" WITH (FORCE);
+ALTER DATABASE :"staging" RENAME TO :"db";
+SQL
+}
+
+# Loads as the superuser so untrusted extensions (PostGIS, file_fdw, ...) can be created;
+# fix_ownership hands everything to the owner role afterwards
 load_file() {
-  local file="$1" db="$2" role="$3" role_args=()
+  local file="$1" db="$2"
   case "$file" in
     *.dump)
-      [[ -z "$role" ]] || role_args=(--role="$role")
-      target_pg pg_restore -d "$db" --no-owner --no-privileges --exit-on-error \
-        ${role_args[@]+"${role_args[@]}"} < "$file"
+      target_pg pg_restore -d "$db" --no-owner --no-privileges --exit-on-error < "$file"
       ;;
     *.sql)
       target_psql -d "$db" < "$file"
@@ -134,8 +156,8 @@ load_file() {
   esac
 }
 
-# Reassigns everything the superuser created (plain .sql case) to the role, leaving
-# extension objects alone. Sequences owned by a column follow their table.
+# Reassigns everything the load created to the role, leaving extension objects alone. Sequences
+# owned by a column follow their table, and a range's multirange is listed on its own.
 fix_ownership() {
   local db="$1" role="$2"
   target_psql -d "$db" -v db="$db" -v role="$role" <<'SQL'
@@ -172,15 +194,22 @@ SELECT format('ALTER SEQUENCE %I.%I OWNER TO %I', s.nspname, c.relname, :'role')
 UNION ALL
 SELECT format('ALTER TYPE %I.%I OWNER TO %I', s.nspname, t.typname, :'role')
   FROM pg_type t JOIN user_schemas s ON s.oid = t.typnamespace
- WHERE t.typtype IN ('e', 'd')
+ WHERE (t.typtype IN ('e', 'd', 'r', 'm')
+        OR (t.typtype = 'c'
+            AND (SELECT c.relkind FROM pg_class c WHERE c.oid = t.typrelid) = 'c'))
    AND NOT EXISTS (SELECT FROM extension_members e
                     WHERE e.classid = 'pg_type'::regclass AND e.objid = t.oid)
 UNION ALL
 SELECT format('ALTER ROUTINE %s OWNER TO %I', p.oid::regprocedure, :'role')
   FROM pg_proc p JOIN user_schemas s ON s.oid = p.pronamespace
- WHERE p.prokind IN ('f', 'p', 'w')
+ WHERE p.prokind IN ('f', 'p', 'w', 'a')
    AND NOT EXISTS (SELECT FROM extension_members e
                     WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid)
+UNION ALL
+SELECT format('ALTER SERVER %I OWNER TO %I', srv.srvname, :'role')
+  FROM pg_foreign_server srv
+ WHERE NOT EXISTS (SELECT FROM extension_members e
+                    WHERE e.classid = 'pg_foreign_server'::regclass AND e.objid = srv.oid)
 \gexec
 SQL
 }
@@ -200,8 +229,29 @@ SELECT table_schema AS "schema",
 SQL
 }
 
+DATABASES_IN_SNAPSHOT=()
 for file in "${SNAPSHOT_FILES[@]}"; do
   db="$(basename "${file%.*}")"
+  # Postgres truncates identifiers past 63 bytes, which would make two names collide
+  (( ${#db} + ${#STAGING_SUFFIX} <= 63 )) || die "Database name '$db' is too long to stage"
+  DATABASES_IN_SNAPSHOT+=("$db")
+done
+
+staged_databases=()
+replacing=false
+drop_staged_databases_on_failure() {
+  [[ "$replacing" == false && ${#staged_databases[@]} -gt 0 ]] || return 0
+  local staging
+  for staging in "${staged_databases[@]}"; do
+    drop_database "$staging" || true
+  done
+  echo "🧹 Dropped the staging databases; the live databases were not touched" >&2
+}
+trap drop_staged_databases_on_failure EXIT
+
+for file in "${SNAPSHOT_FILES[@]}"; do
+  db="$(basename "${file%.*}")"
+  staging="$(staging_name_for "$db")"
   role="$(owner_role_for "$db")"
 
   if [[ -n "$role" ]]; then
@@ -209,23 +259,26 @@ for file in "${SNAPSHOT_FILES[@]}"; do
     ensure_role "$role"
   fi
 
-  echo "🗑️  Recreating $db (owner ${role:-POSTGRES_USER})..."
-  recreate_database "$db" "$role"
-
-  echo "⏳ Loading $(basename "$file") into $db..."
-  load_file "$file" "$db" "$role"
+  echo "⏳ Loading $(basename "$file") into $staging (owner ${role:-POSTGRES_USER})..."
+  create_staging_database "$staging" "$role"
+  staged_databases+=("$staging")
+  load_file "$file" "$staging"
 
   if [[ -n "$role" ]]; then
-    echo "🔧 Fixing ownership in $db..."
-    fix_ownership "$db" "$role"
+    echo "🔧 Fixing ownership in $staging..."
+    fix_ownership "$staging" "$role"
   fi
+done
 
+replacing=true
+for db in "${DATABASES_IN_SNAPSHOT[@]}"; do
+  echo "🔁 Replacing $db..."
+  replace_database "$db" "$(staging_name_for "$db")"
   echo "✅ $db restored"
 done
 
 echo "📊 Row counts"
-for file in "${SNAPSHOT_FILES[@]}"; do
-  db="$(basename "${file%.*}")"
+for db in "${DATABASES_IN_SNAPSHOT[@]}"; do
   echo "── $db"
   print_row_counts "$db"
 done

@@ -166,22 +166,41 @@ docker compose run --rm snapshot restore                                   # mos
 docker compose run --rm snapshot restore dumps/my-other-postgres-20260101T120000Z
 ```
 
-For each `<db>.dump` / `<db>.sql` in the snapshot:
+The restore is **all or nothing**: every database is loaded into a staging copy first, and the
+live databases are only replaced once all of them loaded.
 
-1. If `DB_OWNERS` maps the database to a role, ensures the role exists. A role it has to
-   create gets **no password** — a warning tells you to set one.
-2. `DROP DATABASE IF EXISTS <db> WITH (FORCE)` (kicks connected clients), then
-   `CREATE DATABASE <db>`, owned by that role or by `POSTGRES_USER`.
-3. Loads the data: `pg_restore --no-owner --no-privileges --exit-on-error` (as the owner
-   role, via `--role`) for `.dump`, `psql -v ON_ERROR_STOP=1` for `.sql`.
-4. With an owner role, reassigns every schema, table, view, sequence, enum, domain and
-   function to it — skipping objects that belong to extensions. This is what fixes plain
-   `.sql` dumps, which load as the superuser.
+1. For each `<db>.dump` / `<db>.sql` in the snapshot:
+   1. If `DB_OWNERS` maps the database to a role, ensures the role exists. A role it has to
+      create gets **no password** — a warning tells you to set one.
+   2. Creates `<db>__restoring`, owned by that role or by `POSTGRES_USER`.
+   3. Loads it as the superuser: `pg_restore --no-owner --no-privileges --exit-on-error` for
+      `.dump`, `psql -v ON_ERROR_STOP=1` for `.sql`. Loading as the superuser is what lets
+      untrusted extensions (PostGIS, `file_fdw`, ...) be created.
+   4. With an owner role, reassigns to it every schema, table, view, materialized view,
+      foreign table, sequence, type (enum, domain, composite, range), function, procedure,
+      aggregate and foreign server. Extensions and their objects stay with the superuser.
+2. Only if every load succeeded: `DROP DATABASE <db> WITH (FORCE)` (kicks connected
+   clients) and renames `<db>__restoring` to `<db>`, for each database.
+
+If anything fails — a corrupt dump, a foreign key into excluded data, a missing extension —
+the staging copies are dropped and **the live databases are left as they were**. Staging
+needs room for a second copy of each database while it runs.
 
 It ends with an exact row count per table.
 
 The source's own roles and grants are not carried over (`--no-owner --no-privileges`): the
-local copy is owned by the roles you map, whatever the source used.
+local copy is owned by the roles you map, whatever the source used. Global objects
+(`pg_dumpall --globals-only`: roles, password hashes, tablespaces) are deliberately never
+copied — roles come from `DB_OWNERS` instead. Rarer object kinds not listed above (operators,
+collations, text search configurations, large objects) stay owned by `POSTGRES_USER`.
+
+### Not built in (yet)
+
+- **Parallel dumps (`-Fd -j`).** The directory format can't stream through stdout, so
+  `docker:`/`ssh:` sources would have to write the dump on the source host first — which the
+  "no remote files" design avoids. Worth adding for `url:` sources if dumps get large.
+- **Approximate row counts.** The summary uses exact `count(*)`, which is slow on very large
+  tables.
 
 ## Using it with other containers
 
@@ -220,8 +239,9 @@ it for roles and seed data. It is git-ignored apart from `.gitkeep`.
 ## Safety
 
 - `pull` is read-only against the source: it only runs `pg_dump`.
-- `restore` **destroys** the local databases it restores. Pull a snapshot of the local server
-  first (`url:postgres://<POSTGRES_USER>@127.0.0.1:5432`) if you want to keep the current state.
+- `restore` **replaces** the local databases it restores — but only after every one of them
+  loaded successfully into a staging copy. Pull a snapshot of the local server first
+  (`url:postgres://<POSTGRES_USER>@127.0.0.1:5432`) if you want to keep the current state.
 - Passwords are never logged, never accepted in a URL, and never passed as arguments.
 - A failed pull deletes its partial snapshot directory.
 - The scripts refuse to run outside the `snapshot` container.
@@ -240,9 +260,13 @@ container's own `pg_dump` and are unaffected.
 `docker compose run --rm snapshot <pull|restore> ...`.
 
 **`pg_restore: error: could not execute query`.** `--exit-on-error` stops at the first
-failure, leaving that database partially loaded. Fix the cause and run `restore` again — it
-recreates the database from scratch. A common cause is an extension the local image doesn't
-ship: match `POSTGRES_IMAGE` to the source.
+failure; the staging copies are dropped and the live databases stay as they were. Fix the
+cause and run `restore` again. Common causes:
+
+- `violates foreign key constraint`: a table's data was excluded while another table still
+  points at it. Exclude the referencing table too.
+- `could not open extension control file`: the local image doesn't ship an extension the
+  source uses (PostGIS, for instance). Use an image that has it as `POSTGRES_IMAGE`.
 
 **Snapshots owned by root on Linux.** `pull` hands `dumps/` back to the owner of this
 directory when it finishes; if a run was killed midway, `sudo chown -R $USER dumps`.
